@@ -41,3 +41,9 @@ scripts
 aldy/indelpost/*.c
 build/*
 /_*
+.venv
+.vscode
+indelpost/*.c
+indelpost/*.o
+indelpost/*.so
+aldy/indelpost/*.so
