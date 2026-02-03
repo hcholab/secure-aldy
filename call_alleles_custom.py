@@ -3,27 +3,31 @@
 Call CYP2D6 star alleles on NA07000.bam using matrix extraction + custom solver.
 
 Usage:
-    python call_alleles_custom.py [ortools|sa|hc|abc|all]
+    python call_alleles_custom.py [ortools|sa|hc|abc|exhaustive|all]
 
 Solvers:
-    ortools - Use OR-Tools SCIP (exact ILP solver, guaranteed optimal)
-    sa      - Use Simulated Annealing (heuristic, escapes local optima)
-    hc      - Use Hill Climbing (simple local search, fast)
-    abc     - Use Artificial Bee Colony (swarm intelligence)
-    all     - Compare all solvers (default)
+    ortools    - Use OR-Tools SCIP (exact ILP solver, guaranteed optimal)
+    sa         - Use Simulated Annealing (heuristic, escapes local optima)
+    hc         - Use Hill Climbing (simple local search, fast)
+    abc        - Use Artificial Bee Colony (swarm intelligence)
+    exhaustive - Use Exhaustive Search (tries all feasible combinations)
+    all        - Compare all solvers (default)
 
 Examples:
-    python call_alleles_custom.py ortools    # Fast exact solution
-    python call_alleles_custom.py sa         # Simulated annealing
-    python call_alleles_custom.py hc         # Hill climbing
-    python call_alleles_custom.py abc        # Bee colony optimization
-    python call_alleles_custom.py all        # Compare all methods
+    python call_alleles_custom.py ortools      # Fast exact solution
+    python call_alleles_custom.py sa           # Simulated annealing
+    python call_alleles_custom.py hc           # Hill climbing
+    python call_alleles_custom.py abc          # Bee colony optimization
+    python call_alleles_custom.py exhaustive   # Exhaustive search
+    python call_alleles_custom.py all          # Compare all methods
 """
 
 import numpy as np
 import sys
+import time
 from ortools.linear_solver import pywraplp
 from collections import defaultdict
+from itertools import combinations
 
 from aldy.major_matrix import build_major_matrices, extract_solution, validate_solution
 from aldy.major import _filter_alleles
@@ -37,6 +41,7 @@ from aldy.sam import Sample
 
 def solve_with_ortools_custom(matrices):
     """Custom ILP solver using OR-tools."""
+    start_time = time.time()
     
     print(f"\n{'='*70}")
     print(f"CUSTOM ILP SOLVER (OR-Tools SCIP)")
@@ -146,12 +151,15 @@ def solve_with_ortools_custom(matrices):
     z_val = z.solution_value()
     obj_val = objective.Value()
     
+    runtime = time.time() - start_time
+    
     print(f"\nObjective value: {obj_val:.4f}")
     print(f"  Coverage fit error: {np.sum(np.abs(e_val)):.4f}")
     print(f"  Novel mutation penalty: {matrices.lambda_novel * z_val:.4f}")
     print(f"  Mutation count penalty: {0.1 * np.sum(y_val):.4f}")
+    print(f"\nRuntime: {runtime:.2f} seconds")
     
-    return status, obj_val, x_val, y_val, e_val, z_val
+    return status, obj_val, x_val, y_val, e_val, z_val, runtime
 
 
 def solve_with_simulated_annealing(matrices, max_iterations=10000, initial_temp=100.0, cooling_rate=0.995):
@@ -161,6 +169,8 @@ def solve_with_simulated_annealing(matrices, max_iterations=10000, initial_temp=
     This is a metaheuristic that explores the solution space by occasionally
     accepting worse solutions to escape local optima.
     """
+    
+    start_time = time.time()
     
     print(f"\n{'='*70}")
     print(f"CUSTOM HEURISTIC SOLVER (Simulated Annealing)")
@@ -338,7 +348,10 @@ def solve_with_simulated_annealing(matrices, max_iterations=10000, initial_temp=
     print(f"  Novel mutation penalty: {matrices.lambda_novel * z_best:.4f}")
     print(f"  Mutation count penalty: {0.1 * np.sum(y_best):.4f}")
     
-    return "HEURISTIC", obj_best, x_best, y_best, e_best, z_best
+    runtime = time.time() - start_time
+    print(f"\nRuntime: {runtime:.2f} seconds")
+    
+    return "HEURISTIC", obj_best, x_best, y_best, e_best, z_best, runtime
 
 
 def solve_with_hill_climbing(matrices, max_iterations=5000, restarts=10):
@@ -348,6 +361,8 @@ def solve_with_hill_climbing(matrices, max_iterations=5000, restarts=10):
     Hill climbing is a simple local search that always moves to better neighbors.
     Multiple restarts help escape local optima.
     """
+    
+    start_time = time.time()
     
     print(f"\n{'='*70}")
     print(f"CUSTOM HEURISTIC SOLVER (Hill Climbing)")
@@ -511,7 +526,10 @@ def solve_with_hill_climbing(matrices, max_iterations=5000, restarts=10):
     print(f"  Novel mutation penalty: {matrices.lambda_novel * z_best_global:.4f}")
     print(f"  Mutation count penalty: {0.1 * np.sum(y_best_global):.4f}")
     
-    return "HEURISTIC", obj_best_global, x_best_global, y_best_global, e_best, z_best_global
+    runtime = time.time() - start_time
+    print(f"\nRuntime: {runtime:.2f} seconds")
+    
+    return "HEURISTIC", obj_best_global, x_best_global, y_best_global, e_best, z_best_global, runtime
 
 
 def solve_with_abc(matrices, colony_size=20, max_cycles=100, limit=10):
@@ -523,6 +541,8 @@ def solve_with_abc(matrices, colony_size=20, max_cycles=100, limit=10):
     - Onlooker bees: Choose sources based on quality
     - Scout bees: Explore new random sources
     """
+    
+    start_time = time.time()
     
     print(f"\n{'='*70}")
     print(f"CUSTOM HEURISTIC SOLVER (Artificial Bee Colony)")
@@ -736,7 +756,144 @@ def solve_with_abc(matrices, colony_size=20, max_cycles=100, limit=10):
     print(f"  Novel mutation penalty: {matrices.lambda_novel * z_best:.4f}")
     print(f"  Mutation count penalty: {0.1 * np.sum(y_best):.4f}")
     
-    return "HEURISTIC", obj_best, x_best, y_best, e_best, z_best
+    runtime = time.time() - start_time
+    print(f"\nRuntime: {runtime:.2f} seconds")
+    
+    return "HEURISTIC", obj_best, x_best, y_best, e_best, z_best, runtime
+
+
+def solve_with_exhaustive_search(matrices, max_combos=10000):
+    """
+    Exhaustive search solver - tries all feasible combinations of allele selections.
+    
+    For small problems, this can find the optimal solution by brute force.
+    Limited by max_combos to prevent runtime explosion on large problems.
+    """
+    start_time = time.time()
+    
+    print(f"\n{'='*70}")
+    print(f"CUSTOM EXHAUSTIVE SEARCH SOLVER")
+    print(f"{'='*70}")
+    print(f"Problem size:")
+    print(f"  - {matrices.n_alleles} allele copy variables")
+    print(f"  - {matrices.n_mutations} mutation variables")
+    print(f"  - {matrices.n_cn_configs} CN configurations")
+    print(f"  - {len(matrices.P_indices)} ordering constraints")
+    
+    def compute_objective(x, y, z):
+        """Compute objective value for given solution."""
+        e = matrices.c - matrices.A @ x - y
+        return np.sum(np.abs(e)) + matrices.lambda_novel * z + 0.1 * np.sum(y)
+    
+    def is_feasible(x, y):
+        """Check if solution satisfies hard constraints."""
+        # CN configuration must match
+        for t in range(matrices.n_cn_configs):
+            if abs(matrices.B[t, :] @ x - matrices.d[t]) > 0.5:
+                return False
+        
+        # Ordering constraints
+        for j1, j2 in matrices.P_indices:
+            if x[j1] > x[j2] + 0.5:
+                return False
+        
+        # One novel per position
+        for pos, indices in matrices.position_groups.items():
+            if sum(y[i] for i in indices) > 1.5:
+                return False
+        
+        return True
+    
+    print(f"\nGenerating all feasible x combinations...")
+    
+    # Generate all feasible x combinations (respecting CN constraints and ordering)
+    feasible_x_combos = []
+    
+    # For each CN config, generate all valid combinations
+    cn_config_alleles = [[] for _ in range(matrices.n_cn_configs)]
+    for j in range(matrices.n_alleles):
+        for t in range(matrices.n_cn_configs):
+            if matrices.B[t, j] > 0.5:
+                cn_config_alleles[t].append(j)
+    
+    # Generate combinations respecting ordering constraints
+    def generate_ordered_combos(config_idx, current_x):
+        if config_idx == matrices.n_cn_configs:
+            return [current_x.copy()]
+        
+        required = int(matrices.d[config_idx])
+        candidates = cn_config_alleles[config_idx]
+        
+        result = []
+        for combo in combinations(candidates, required):
+            x_new = current_x.copy()
+            for j in combo:
+                x_new[j] = 1
+            result.extend(generate_ordered_combos(config_idx + 1, x_new))
+        
+        return result
+    
+    feasible_x_combos = generate_ordered_combos(0, np.zeros(matrices.n_alleles))
+    print(f"  Found {len(feasible_x_combos)} feasible x combinations")
+    
+    if len(feasible_x_combos) > max_combos:
+        print(f"  Limiting to first {max_combos} combinations (too many to evaluate all)")
+        feasible_x_combos = feasible_x_combos[:max_combos]
+    
+    # For each feasible x, try all feasible y combinations
+    print(f"\nSearching through all feasible solutions...")
+    
+    x_best = None
+    y_best = None
+    z_best = 0
+    obj_best = float('inf')
+    solutions_evaluated = 0
+    
+    for x in feasible_x_combos:
+        # Try y = all zeros first
+        y = np.zeros(matrices.n_mutations)
+        z = 0
+        
+        if is_feasible(x, y):
+            obj = compute_objective(x, y, z)
+            solutions_evaluated += 1
+            if obj < obj_best:
+                x_best = x.copy()
+                y_best = y.copy()
+                z_best = z
+                obj_best = obj
+        
+        # Try minimal novel mutations
+        if matrices.position_groups:
+            for pos, indices in matrices.position_groups.items():
+                for i in indices:
+                    y_test = np.zeros(matrices.n_mutations)
+                    y_test[i] = 1
+                    z_test = 1
+                    
+                    if is_feasible(x, y_test):
+                        obj = compute_objective(x, y_test, z_test)
+                        solutions_evaluated += 1
+                        if obj < obj_best:
+                            x_best = x.copy()
+                            y_best = y_test.copy()
+                            z_best = z_test
+                            obj_best = obj
+    
+    runtime = time.time() - start_time
+    
+    # Compute final error vector
+    e_best = matrices.c - matrices.A @ x_best - y_best
+    
+    print(f"\n✓ Completed exhaustive search")
+    print(f"  Solutions evaluated: {solutions_evaluated}")
+    print(f"\nBest objective value: {obj_best:.4f}")
+    print(f"  Coverage fit error: {np.sum(np.abs(e_best)):.4f}")
+    print(f"  Novel mutation penalty: {matrices.lambda_novel * z_best:.4f}")
+    print(f"  Mutation count penalty: {0.1 * np.sum(y_best):.4f}")
+    print(f"\nRuntime: {runtime:.2f} seconds")
+    
+    return "HEURISTIC", obj_best, x_best, y_best, e_best, z_best, runtime
 
 
 def main(solver_type='all', bam_file="../data/NA07000.bam", gene_name="CYP2D6", profile_name="illumina"):
@@ -822,13 +979,15 @@ def main(solver_type='all', bam_file="../data/NA07000.bam", gene_name="CYP2D6", 
     
     # Solve with selected solver
     if solver_type == 'ortools':
-        status, obj_val, x_val, y_val, e_val, z_val = solve_with_ortools_custom(matrices)
+        status, obj_val, x_val, y_val, e_val, z_val, runtime = solve_with_ortools_custom(matrices)
     elif solver_type == 'sa':
-        status, obj_val, x_val, y_val, e_val, z_val = solve_with_simulated_annealing(matrices)
+        status, obj_val, x_val, y_val, e_val, z_val, runtime = solve_with_simulated_annealing(matrices)
     elif solver_type == 'hc':
-        status, obj_val, x_val, y_val, e_val, z_val = solve_with_hill_climbing(matrices)
+        status, obj_val, x_val, y_val, e_val, z_val, runtime = solve_with_hill_climbing(matrices)
     elif solver_type == 'abc':
-        status, obj_val, x_val, y_val, e_val, z_val = solve_with_abc(matrices)
+        status, obj_val, x_val, y_val, e_val, z_val, runtime = solve_with_abc(matrices)
+    elif solver_type == 'exhaustive':
+        status, obj_val, x_val, y_val, e_val, z_val, runtime = solve_with_exhaustive_search(matrices)
     elif solver_type == 'all':
         print(f"\n{'='*70}")
         print(f"COMPARING ALL SOLVERS")
@@ -837,32 +996,39 @@ def main(solver_type='all', bam_file="../data/NA07000.bam", gene_name="CYP2D6", 
         results = []
         
         # Solve with OR-tools
-        print(f"\n[1/4] Running OR-Tools SCIP...")
-        status1, obj1, x1, y1, e1, z1 = solve_with_ortools_custom(matrices)
+        print(f"\n[1/5] Running OR-Tools SCIP...")
+        status1, obj1, x1, y1, e1, z1, rt1 = solve_with_ortools_custom(matrices)
         if x1 is not None:
             alleles1, muts1 = extract_solution(matrices, x1, y1)
-            results.append(('OR-Tools SCIP', obj1, alleles1, len(muts1)))
+            results.append(('OR-Tools SCIP', obj1, alleles1, len(muts1), rt1))
         
         # Solve with Simulated Annealing
-        print(f"\n[2/4] Running Simulated Annealing...")
-        status2, obj2, x2, y2, e2, z2 = solve_with_simulated_annealing(matrices)
+        print(f"\n[2/5] Running Simulated Annealing...")
+        status2, obj2, x2, y2, e2, z2, rt2 = solve_with_simulated_annealing(matrices)
         if x2 is not None:
             alleles2, muts2 = extract_solution(matrices, x2, y2)
-            results.append(('Simulated Annealing', obj2, alleles2, len(muts2)))
+            results.append(('Simulated Annealing', obj2, alleles2, len(muts2), rt2))
         
         # Solve with Hill Climbing
-        print(f"\n[3/4] Running Hill Climbing...")
-        status3, obj3, x3, y3, e3, z3 = solve_with_hill_climbing(matrices)
+        print(f"\n[3/5] Running Hill Climbing...")
+        status3, obj3, x3, y3, e3, z3, rt3 = solve_with_hill_climbing(matrices)
         if x3 is not None:
             alleles3, muts3 = extract_solution(matrices, x3, y3)
-            results.append(('Hill Climbing', obj3, alleles3, len(muts3)))
+            results.append(('Hill Climbing', obj3, alleles3, len(muts3), rt3))
         
         # Solve with ABC
-        print(f"\n[4/4] Running Artificial Bee Colony...")
-        status4, obj4, x4, y4, e4, z4 = solve_with_abc(matrices)
+        print(f"\n[4/5] Running Artificial Bee Colony...")
+        status4, obj4, x4, y4, e4, z4, rt4 = solve_with_abc(matrices)
         if x4 is not None:
             alleles4, muts4 = extract_solution(matrices, x4, y4)
-            results.append(('ABC', obj4, alleles4, len(muts4)))
+            results.append(('ABC', obj4, alleles4, len(muts4), rt4))
+        
+        # Solve with Exhaustive Search
+        print(f"\n[5/5] Running Exhaustive Search...")
+        status5, obj5, x5, y5, e5, z5, rt5 = solve_with_exhaustive_search(matrices)
+        if x5 is not None:
+            alleles5, muts5 = extract_solution(matrices, x5, y5)
+            results.append(('Exhaustive Search', obj5, alleles5, len(muts5), rt5))
 
         
         # Compare results
@@ -870,12 +1036,12 @@ def main(solver_type='all', bam_file="../data/NA07000.bam", gene_name="CYP2D6", 
         print(f"SOLVER COMPARISON")
         print(f"{'='*70}")
         
-        print(f"\n{'Solver':<25} {'Objective':>12} {'Alleles':<20} {'Novel':>6}")
-        print(f"{'-'*70}")
-        for name, obj, alleles, n_novel in results:
-            allele_str = str(alleles) if len(str(alleles)) < 20 else str(alleles)[:17] + "..."
-            print(f"{name:<25} {obj:>12.4f} {allele_str:<20} {n_novel:>6}")
+        print(f"\n{'Solver':<25} {'Objective':>12} {'Runtime':>10} {'Alleles':<20} {'Novel':>6}")
+        print(f"{'-'*85}")
+        for name, obj, alleles, n_novel, runtime in results:
         
+            allele_str = str(alleles) if len(str(alleles)) < 20 else str(alleles)[:17] + "..."
+            print(f"{name:<25} {obj:>12.4f} {runtime:>9.2f}s {allele_str:<20} {n_novel:>6}")
         # Find best solution
         best_idx = np.argmin([r[1] for r in results])
         best_name = results[best_idx][0]
@@ -890,31 +1056,34 @@ def main(solver_type='all', bam_file="../data/NA07000.bam", gene_name="CYP2D6", 
         else:
             print(f"⚠ Solvers found DIFFERENT alleles")
             unique_solutions = {}
-            for name, obj, alleles, n_novel in results:
+            for name, obj, alleles, n_novel, runtime in results:
                 key = tuple(sorted(alleles))
                 if key not in unique_solutions:
                     unique_solutions[key] = []
-                unique_solutions[key].append((name, obj))
+                unique_solutions[key].append((name, obj, runtime))
             
             print(f"\nUnique solutions found:")
             for i, (alleles_key, solvers) in enumerate(unique_solutions.items(), 1):
                 print(f"  Solution {i}: {list(alleles_key)}")
-                for solver, obj in solvers:
-                    print(f"    - {solver}: {obj:.4f}")
+                for solver, obj, runtime in solvers:
+                    print(f"    - {solver}: {obj:.4f} ({runtime:.2f}s)")
         
         # Use the best solution
         if best_name == 'OR-Tools SCIP':
-            status, obj_val, x_val, y_val, e_val, z_val = status1, obj1, x1, y1, e1, z1
+            status, obj_val, x_val, y_val, e_val, z_val, runtime = status1, obj1, x1, y1, e1, z1, rt1
         elif best_name == 'Simulated Annealing':
-            status, obj_val, x_val, y_val, e_val, z_val = status2, obj2, x2, y2, e2, z2
+            status, obj_val, x_val, y_val, e_val, z_val, runtime = status2, obj2, x2, y2, e2, z2, rt2
         elif best_name == 'Hill Climbing':
-            status, obj_val, x_val, y_val, e_val, z_val = status3, obj3, x3, y3, e3, z3
+            status, obj_val, x_val, y_val, e_val, z_val, runtime = status3, obj3, x3, y3, e3, z3, rt3
         else:  # ABC
-            status, obj_val, x_val, y_val, e_val, z_val = status4, obj4, x4, y4, e4, z4
+            if best_name == 'ABC':
+                status, obj_val, x_val, y_val, e_val, z_val, runtime = status4, obj4, x4, y4, e4, z4, rt4
+            else:  # Exhaustive Search
+                status, obj_val, x_val, y_val, e_val, z_val, runtime = status5, obj5, x5, y5, e5, z5, rt5
         
         print(f"\n→ Using {best_name} solution")
     else:
-        raise ValueError(f"Unknown solver type: {solver_type}. Use 'ortools', 'sa', 'hc', 'abc', or 'all'")
+        raise ValueError(f"Unknown solver type: {solver_type}. Use 'ortools', 'sa', 'hc', 'abc', 'exhaustive', or 'all'")
     
     if x_val is None:
         print("\n✗ Solver failed!")
