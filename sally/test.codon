@@ -1,0 +1,55 @@
+"""
+Testing secure star-allele calling via fully homomorphic encryption.
+"""
+import client, server
+
+
+def test_sally_workflow(bam_file, gene_name, profile_name, solver_type):
+    """Load BAM file and call alleles using custom solver."""
+    
+    print("="*70)
+    print("SECURE STAR-ALLELE CALLING USING FHE")
+    print("="*70)
+
+    cn_solution, filtered_cov, func_muts = client.preprocess(
+        bam_file, gene_name, profile_name)
+    
+    matrices, obj_val, x_val, y_val, e_val, z_val = server.call_alleles(
+        gene_name, filtered_cov, cn_solution, func_muts, solver_type)
+
+    # # Non-secure: Validate revealed solution
+    # server._debug_validate(matrices, x_val, y_val, e_val, z_val)
+    
+    # # Extract human-readable solution
+    # client.postprocess(matrices, x_val, y_val, obj_val, gene_name)
+
+
+if __name__ == "__main__":
+    import sys
+    
+    bam_file = sys.argv[1]
+    gene_name = sys.argv[2]
+    profile_name = sys.argv[3]
+    solver_type = sys.argv[4]
+    
+    if solver_type not in ['ortools', 'sa', 'hc', 'abc', 'all']:
+        print(f"Usage: {sys.argv[0]} [BAM_FILE GENE PROFILE SOLVER]")
+        print(f"   or: {sys.argv[0]} [SOLVER]")
+        print(f"\nSOLVER options:")
+        print(f"  ortools: Use OR-Tools SCIP solver (exact)")
+        print(f"  sa:      Use Simulated Annealing (heuristic)")
+        print(f"  hc:      Use Hill Climbing (local search)")
+        print(f"  abc:     Use Artificial Bee Colony (swarm intelligence)")
+        print(f"  all:     Compare all solvers (default)")
+        sys.exit(1)
+    
+    print(f"Selected solver: {solver_type.upper()}")
+    
+    try:
+        test_sally_workflow(
+            bam_file=bam_file,
+            gene_name=gene_name,
+            profile_name=profile_name,
+            solver_type=solver_type)
+    except Exception as e:
+        print(f"\n✗ Error: {e}")

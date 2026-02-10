@@ -1,0 +1,114 @@
+"""
+Bloom filter implementation in Sequre/Shechi.
+"""
+from math import log
+from numpy.create import zeros
+
+from sequre.utils.utils import one_hot_vector
+
+
+class CipherBloomFilter[env_t, ctxt_t]:
+    """
+    Space-efficient probabilistic data structure for membership testing.
+    Type environment and ciphertext types are parameterized for flexibility.
+    Having both instead of just one is old Codon artifact and can be simplified in the future.
+    ctxt_t should be env_t.ctype.
+    
+    A Bloom filter uses multiple hash functions to set bits in a bit array.
+    It can definitively say an element is NOT in the set, but may have false
+    positives when checking membership.
+    """
+    
+    _env: env_t
+    _bit_array: ctxt_t
+    _size: int
+    _num_hashes: int
+    
+    def __init__(self, env: env_t, expected_elements: int, false_positive_rate: float = 0.01):
+        """
+        Initialize Bloom filter with optimal size and hash count.
+        
+        Args:
+            expected_elements: Expected number of elements to be added
+            false_positive_rate: Desired false positive probability (default 0.01 = 1%)
+        """
+        assert env.is_published(), (
+            "Environment must be published for Bloom filter to be secure.")
+        self._env = env
+
+        # Use ciphertext size as the size of the bit array
+        self._size = env.params.slots()  
+        self._bit_array = env.zeros_ciphertext()
+
+        # Calculate optimal size of bit array: m = -n * ln(p) / (ln(2)^2)
+        required_size = int(
+            -expected_elements * log(false_positive_rate) / (log(2) ** 2))
+        if required_size > self._size:
+            print(
+                f"Warning! Optimal Bloom filter size {required_size} "
+                f"exceeds ciphertext limit {self._size}.\n"
+                f"Bloom filter is restricted to "
+                f"a single ciphertext for better performance.\n"
+                f"Reduce expected elements or increase ciphertext size.")
+            
+        # Calculate optimal number of hash functions: k = m/n * ln(2)
+        self._num_hashes = max(1, int(self._size / expected_elements * log(2)))
+    
+    def _hash(self, item: str, seed: int) -> int:
+        """
+        Generate hash value for item with given seed.
+        Uses simple hash-based approach with seed variation.
+        """
+        h = hash(item + str(seed))
+        return abs(h) % self._size
+    
+    def add(self, item: str) -> None:
+        """
+        Add an item to the Bloom filter.
+        
+        Args:
+            item: String element to add to the filter
+        """
+        env = self._env
+        hashes = zeros((self._size,), dtype=int)
+        
+        for i in range(self._num_hashes):
+            idx = self._hash(item, i)
+            hashes[idx] = 1
+        
+        # Bitwise OR: a + b - a * b
+        self._bit_array = env.add(
+            env.mul(self._bit_array, (1 - hashes)),
+            hashes)
+    
+    def contains(self, item: str) -> ctxt_t:
+        """
+        Check if an item might be in the Bloom filter.
+        
+        Returns:
+            bool: False if definitely not in set, True if possibly in set
+                  (may have false positives)
+        """
+        env = self._env
+        contains_mask = env.encrypt(one_hot_vector(0, self._size, TP=int))
+        
+        for i in range(self._num_hashes):
+            idx = self._hash(item, i)
+            check = env.mul(self._bit_array, one_hot_vector(idx, self._size, TP=int))
+            env.irotate(check, idx)
+            env.imul(contains_mask, check)
+
+        return contains_mask
+    
+    def clear(self) -> None:
+        """Reset the Bloom filter to empty state."""
+        self._bit_array = self._env.zeros_ciphertext()
+    
+    def get_stats(self) -> tuple[int, int]:
+        """
+        Return filter statistics.
+        
+        Returns:
+            Tuple of (bit_array_size, num_hashes)
+        """
+        return (self._size, self._num_hashes)

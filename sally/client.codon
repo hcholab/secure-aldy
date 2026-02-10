@@ -1,0 +1,128 @@
+"""
+Client-side code for secure star-allele calling:
+    - Preprocess BAM file and gene profile to extract coverage and functional mutations.
+    - Postprocess ILP solution to determine selected alleles and novel mutations.
+"""
+
+
+@python
+def preprocess(bam_file, gene_name, profile_name):
+    from aldy.sam import Sample
+    from aldy.cn import estimate_cn
+    from aldy.solutions import CNSolution
+    from aldy.gene import Gene, Mutation
+    from aldy.profile import Profile
+    from aldy.common import script_path
+    from aldy.coverage import Coverage
+
+    def filter_coverage(
+        coverage: Coverage, cn_solution: CNSolution
+    ) -> Coverage:
+        """
+        Filter out low-quality mutations that are not expressed.
+
+        :returns: The coverage of high-quality variants.
+        """
+
+        def filter_fns(cov, mut):
+            cond = cov.basic_filter(mut, cn=coverage.profile.cn_max)
+            if mut.op != "_":
+                cond = cond and cov.basic_filter(
+                    mut, cn=cn_solution.position_cn(mut.pos) + 0.5
+                )
+            return cond
+
+        cov = coverage.filtered(Coverage.quality_filter)
+        cov = cov.filtered(filter_fns)
+
+        return cov
+    
+    print(f"\nInput:")
+    print(f"  BAM file: {bam_file}")
+    print(f"  Gene: {gene_name}")
+    print(f"  Profile: {profile_name}")
+
+    # Load gene and profile
+    print(f"\nLoading gene database...")
+    gene = Gene(script_path(f"aldy.resources.genes/{gene_name.lower()}.yml"))
+    profile = Profile.load(gene, profile_name)
+    
+    print(f"  Gene: {gene.name}")
+    print(f"  Genome: {gene.genome}")
+    print(f"  Known alleles: {len(gene.alleles)}")
+    print(f"  Functional mutations: {len([m for m in gene.mutations if gene.is_functional(m)])}")
+    
+    # Load sample from BAM
+    print(f"\nLoading sample from BAM file...")
+    sample = Sample(gene, profile, bam_file, None, None)
+    
+    # Calculate average coverage manually
+    total_cov = sum(
+        sum(len(reads) for reads in pos_cov.values())
+        for pos_cov in sample.coverage._coverage.values()
+    )
+    num_positions = len(sample.coverage._coverage)
+    avg_cov = total_cov / num_positions if num_positions > 0 else 0
+    print(f"  Average coverage: {avg_cov:.2f}x")
+    
+    # Get CN solution from CN caller (instead of assuming diploid)
+    print("\nEstimating copy number (CN) configuration...")
+    cn_solutions = estimate_cn(gene, profile, sample.coverage, solver="cbc")
+    if not cn_solutions:
+        print("\n✗ No CN solutions found; falling back to diploid.")
+        cn_solution = CNSolution(gene, 0, ["1", "1"])
+    else:
+        cn_solution = cn_solutions[0]
+    print(f"\nCN configuration: {dict(cn_solution.solution)}")
+
+    filtered_cov = filter_coverage(sample.coverage, cn_solution)
+    
+    func_muts = {
+        Mutation(*m)
+        for m in gene.mutations
+        if gene.is_functional(m) and filtered_cov[Mutation(*m)] > 0
+    }
+    func_muts |= {
+        m
+        for m in gene.random_mutations
+        if gene.is_functional((m.pos, m.op)) and filtered_cov[m] > 0
+    }
+
+    print(f"  Functional mutations observed: {len(func_muts)}")
+    return cn_solution, filtered_cov, func_muts
+
+
+@python
+def postprocess(matrices, x_val, y_val, obj_val, gene_name):
+    from modelling.ilp import extract_solution
+    
+    selected_alleles, novel_muts = extract_solution(matrices, x_val, y_val)
+    
+    print(f"\n{'='*70}")
+    print(f"FINAL RESULT")
+    print(f"{'='*70}")
+    
+    # Count alleles
+    from collections import Counter
+    allele_counts = Counter(selected_alleles)
+    
+    print(f"\nGenotype: {gene_name} ", end="")
+    genotype_str = "/".join([f"*{a}" for a in sorted(allele_counts.keys())])
+    print(genotype_str)
+    
+    print(f"\nSelected alleles:")
+    for allele, count in sorted(allele_counts.items()):
+        print(f"  *{allele:15} × {count}")
+    
+    if novel_muts:
+        print(f"\nNovel mutations detected:")
+        for mut in novel_muts:
+            print(f"  {mut}")
+    else:
+        print(f"\n✓ No novel mutations (all explained by known alleles)")
+    
+    print(f"\nScore: {obj_val:.4f}")
+    
+    print(f"\n{'='*70}")
+    print(f"SUCCESS - Allele calling completed using custom ILP solver!")
+    print(f"{'='*70}\n")

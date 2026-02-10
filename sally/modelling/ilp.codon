@@ -1,0 +1,304 @@
+"""
+Module for extracting major star-allele detection problem into standard ILP matrix form.
+
+This module processes gene alleles, coverage data, and copy-number solutions into
+matrices and vectors that can be used with any ILP solver.
+"""
+
+from typing import Dict, List, Tuple, Set, Any
+from dataclasses import dataclass
+import numpy as np
+from natsort import natsorted
+
+from .gene import MajorAllele, Mutation, Gene
+from .coverage import Coverage
+from .solutions import CNSolution
+
+
+@dataclass
+class MajorILPMatrices:
+    """
+    Container for the ILP problem in standard matrix form.
+    
+    The problem is formulated as:
+        min ||e||_1 + λz + 0.1·1^T·y
+        s.t. A·x + y + e = c           (coverage equality)
+             B·x = d                   (CN configuration satisfaction)
+             P·x ≤ 0                   (ordering constraints)
+             (A_i·x > 0) XOR (y_i = 1) for all i  (mutation explanation)
+             z ≥ y_i for all i         (novel mutation indicator)
+             z ≤ 1^T·y
+             Σ(y_i : pos(i)=p) ≤ 1 for all p  (one novel per position)
+             x ∈ {0,1}^n, y ∈ {0,1}^m, z ∈ {0,1}, e ∈ R^m
+    
+    Attributes:
+        A: Allele-mutation incidence matrix (m × n), A[i,j] = 1 if allele copy j has mutation i
+        B: CN configuration matrix (k × n), B[t,j] = 1 if allele copy j has CN config t
+        c: Normalized coverage vector (m,)
+        d: CN configuration counts (k,)
+        P_indices: List of (j1, j2) pairs where x[j1] ≥ x[j2] (ordering)
+        lambda_novel: Penalty for any novel mutation
+        
+        # Metadata for interpreting solutions
+        allele_vars: List of (allele_name, copy_index) for each x variable
+        mutation_vars: List of Mutation objects for each y variable
+        mutation_positions: Dict mapping mutation index to genomic position
+        cn_configs: List of CN configuration names
+        position_groups: Dict mapping position to list of mutation indices
+    """
+    
+    # Core matrices and vectors
+    A: np.ndarray  # m × n (mutations × allele copies)
+    B: np.ndarray  # k × n (CN configs × allele copies)
+    c: np.ndarray  # m (coverage)
+    d: np.ndarray  # k (CN counts)
+    P_indices: List[Tuple[int, int]]  # Ordering constraints
+    lambda_novel: float  # Penalty coefficient
+    
+    # Metadata for variable interpretation
+    allele_vars: List[Tuple[str, int]]  # (allele_name, copy_index)
+    mutation_vars: List[Mutation]  # Mutation objects
+    mutation_positions: Dict[int, int]  # mutation_idx -> position
+    cn_configs: List[str]  # CN configuration names
+    position_groups: Dict[int, List[int]]  # position -> [mutation_indices]
+    
+    @property
+    def n_alleles(self) -> int:
+        """Number of allele copy variables (dimension of x)."""
+        return self.A.shape[1]
+    
+    @property
+    def n_mutations(self) -> int:
+        """Number of mutation variables (dimension of y)."""
+        return self.A.shape[0]
+    
+    @property
+    def n_cn_configs(self) -> int:
+        """Number of CN configurations (dimension of d)."""
+        return self.B.shape[0]
+
+
+def build_major_matrices(
+    gene: Gene,
+    coverage: Coverage,
+    cn_solution: CNSolution,
+    allele_dict: Dict[str, MajorAllele],
+    func_muts: Set[Mutation],
+) -> MajorILPMatrices:
+    """
+    Build ILP matrices from gene data, coverage, and CN solution.
+    
+    :param gene: Gene instance
+    :param coverage: Coverage instance
+    :param cn_solution: Copy-number solution
+    :param allele_dict: Dictionary of candidate major alleles
+    :param func_muts: Set of functional mutations observed
+    :return: MajorILPMatrices object containing all matrices and metadata
+    """
+    
+    # Step 1: Build allele copies based on CN solution
+    allele_copies: List[Tuple[str, int, MajorAllele]] = []
+    for allele_name in natsorted(allele_dict.keys()):
+        allele = allele_dict[allele_name]
+        max_cn = cn_solution.solution[allele.cn_config]
+        for copy_idx in range(max_cn):
+            allele_copies.append((allele_name, copy_idx, allele))
+    
+    n_alleles = len(allele_copies)
+    
+    # Step 2: Build mutation list (include both actual mutations and reference "_")
+    mutation_list: List[Mutation] = []
+    mutation_to_idx: Dict[Mutation, int] = {}
+    
+    # Add functional mutations
+    for m in sorted(func_muts):
+        if m not in mutation_to_idx:
+            mutation_to_idx[m] = len(mutation_list)
+            mutation_list.append(m)
+    
+    # Add reference mutations for each position
+    positions = set(m.pos for m in func_muts)
+    for pos in sorted(positions):
+        ref_m = Mutation(pos, "_")
+        if ref_m not in mutation_to_idx:
+            mutation_to_idx[ref_m] = len(mutation_list)
+            mutation_list.append(ref_m)
+    
+    n_mutations = len(mutation_list)
+    
+    # Step 3: Build A matrix (allele-mutation incidence)
+    A = np.zeros((n_mutations, n_alleles), dtype=int)
+    
+    for j, (allele_name, copy_idx, allele) in enumerate(allele_copies):
+        # Mark functional mutations present in this allele
+        for m in allele.func_muts:
+            if m in mutation_to_idx:
+                i = mutation_to_idx[m]
+                A[i, j] = 1
+        
+        # Mark reference positions (positions without mutations in this allele)
+        for m in mutation_list:
+            if m.op == "_":
+                pos = m.pos
+                if not gene.has_coverage(allele_name, pos):
+                    continue
+                # Check if this position has an insertion (insertions still contribute)
+                has_non_ins = any(
+                    ma.pos == pos and ma.op[:3] != "ins" 
+                    for ma in allele.func_muts
+                )
+                if not has_non_ins:
+                    i = mutation_to_idx[m]
+                    A[i, j] = 1
+    
+    # Step 4: Build c vector (normalized coverage)
+    c = np.zeros(n_mutations)
+    for i, m in enumerate(mutation_list):
+        if coverage.single_copy(m.pos, cn_solution) == 0:
+            c[i] = 0.0
+        else:
+            c[i] = coverage[m] / coverage.single_copy(m, cn_solution)
+    
+    # Step 5: Build B matrix and d vector (CN configuration constraints)
+    cn_config_list = natsorted(set(allele.cn_config for _, _, allele in allele_copies))
+    cn_config_to_idx = {cfg: idx for idx, cfg in enumerate(cn_config_list)}
+    n_cn_configs = len(cn_config_list)
+    
+    B = np.zeros((n_cn_configs, n_alleles), dtype=int)
+    d = np.zeros(n_cn_configs, dtype=int)
+    
+    for t, cfg in enumerate(cn_config_list):
+        d[t] = cn_solution.solution[cfg]
+        for j, (_, _, allele) in enumerate(allele_copies):
+            if allele.cn_config == cfg:
+                B[t, j] = 1
+    
+    # Step 6: Build ordering constraints (x[j+1] <= x[j] for same allele)
+    P_indices: List[Tuple[int, int]] = []
+    current_idx = 0
+    for allele_name in natsorted(allele_dict.keys()):
+        allele = allele_dict[allele_name]
+        max_cn = cn_solution.solution[allele.cn_config]
+        for copy_idx in range(1, max_cn):
+            # x[current_idx + copy_idx] <= x[current_idx + copy_idx - 1]
+            # Rewritten as: x[current_idx + copy_idx] - x[current_idx + copy_idx - 1] <= 0
+            P_indices.append((current_idx + copy_idx, current_idx + copy_idx - 1))
+        current_idx += max_cn
+    
+    # Step 7: Build position groups (for one-novel-per-position constraint)
+    position_groups: Dict[int, List[int]] = {}
+    for i, m in enumerate(mutation_list):
+        if m.op != "_" and m.op[:3] != "ins":
+            pos = m.pos
+            if pos not in position_groups:
+                position_groups[pos] = []
+            position_groups[pos].append(i)
+    
+    # Step 8: Build mutation positions dict
+    mutation_positions = {i: m.pos for i, m in enumerate(mutation_list)}
+    
+    # Step 9: Build metadata
+    allele_vars = [(name, idx) for name, idx, _ in allele_copies]
+    lambda_novel = coverage.profile.major_novel
+    
+    return MajorILPMatrices(
+        A=A,
+        B=B,
+        c=c,
+        d=d,
+        P_indices=P_indices,
+        lambda_novel=lambda_novel,
+        allele_vars=allele_vars,
+        mutation_vars=mutation_list,
+        mutation_positions=mutation_positions,
+        cn_configs=cn_config_list,
+        position_groups=position_groups,
+    )
+
+
+def extract_solution(
+    matrices: MajorILPMatrices,
+    x: np.ndarray,
+    y: np.ndarray,
+) -> Tuple[List[str], List[Mutation]]:
+    """
+    Extract human-readable solution from variable values.
+    
+    :param matrices: The ILP matrices containing metadata
+    :param x: Binary allele selection vector (n,)
+    :param y: Binary novel mutation vector (m,)
+    :return: Tuple of (selected_alleles, novel_mutations)
+    """
+    selected_alleles = [
+        matrices.allele_vars[j][0]  # allele name
+        for j in range(matrices.n_alleles)
+        if x[j] > 0.5  # binary variable is selected
+    ]
+    
+    novel_mutations = [
+        matrices.mutation_vars[i]
+        for i in range(matrices.n_mutations)
+        if y[i] > 0.5  # binary variable is selected
+    ]
+    
+    return selected_alleles, novel_mutations
+
+
+def validate_solution(
+    matrices: MajorILPMatrices,
+    x: np.ndarray,
+    y: np.ndarray,
+    e: np.ndarray,
+    z: float,
+) -> Dict[str, Any]:
+    """
+    Validate that a solution satisfies all constraints and compute objective.
+    
+    :param matrices: The ILP matrices
+    :param x: Allele selection vector
+    :param y: Novel mutation vector
+    :param e: Error vector
+    :param z: Novel indicator
+    :return: Dict with validation results and constraint violations
+    """
+    violations = []
+    
+    # Check coverage equality: A·x + y + e = c
+    coverage_lhs = matrices.A @ x + y + e
+    coverage_diff = np.abs(coverage_lhs - matrices.c)
+    if len(coverage_diff) > 0 and np.max(coverage_diff) > 1e-6:
+        violations.append(f"Coverage equality violated: max diff = {np.max(coverage_diff)}")
+    
+    # Check CN configuration: B·x = d
+    cn_lhs = matrices.B @ x
+    cn_diff = np.abs(cn_lhs - matrices.d)
+    if len(cn_diff) > 0 and np.max(cn_diff) > 1e-6:
+        violations.append(f"CN configuration violated: max diff = {np.max(cn_diff)}")
+    
+    # Check ordering: x[j1] <= x[j2] for all (j1, j2) in P_indices
+    for j1, j2 in matrices.P_indices:
+        if x[j1] > x[j2] + 1e-6:
+            violations.append(f"Ordering violated: x[{j1}] = {x[j1]} > x[{j2}] = {x[j2]}")
+    
+    # Check novel indicator: z >= y[i] for all i
+    for i in range(matrices.n_mutations):
+        if z < y[i] - 1e-6:
+            violations.append(f"Novel indicator violated: z = {z} < y[{i}] = {y[i]}")
+    
+    # Check one novel per position
+    for pos, indices in matrices.position_groups.items():
+        total = sum(y[i] for i in indices)
+        if total > 1 + 1e-6:
+            violations.append(f"One-novel-per-position violated at pos {pos}: sum = {total}")
+    
+    # Compute objective
+    objective = np.sum(np.abs(e)) + matrices.lambda_novel * z + 0.1 * np.sum(y)
+    
+    return {
+        "valid": len(violations) == 0,
+        "violations": violations,
+        "objective": objective,
+        "coverage_fit": np.sum(np.abs(e)),
+        "novel_penalty": matrices.lambda_novel * z,
+        "mutation_penalty": 0.1 * np.sum(y),
+    }
