@@ -4,22 +4,19 @@ def test_bloom_filter():
     from ..modelling.bloom import CipherBloomFilter
     from ..patch.lattiseq.env import CKKSEnv
     
-    print("\nTesting secure Bloom filter...")
-    env = CKKSEnv()
+    env = CKKSEnv(debug=True)
     bloom = CipherBloomFilter[CKKSEnv, Ciphertext](
-        env.publish(), expected_elements=32)
+        env, expected_elements=32)
+    print(f"\n⚙️ Testing secure Bloom filter {bloom.get_stats()} ...")
     
     items_to_add = ["apple", "banana", "cherry"]
     for item in items_to_add:
         bloom.add(item)
     
-    print("DEBUG", env.decrypt(bloom._bit_array, dtype=int),
-          bloom._hash("apple", 0), bloom._hash("banana", 0), bloom._hash("cherry", 0))
-    
     # Test that added items are possibly contained
     for item in items_to_add:
         encrypted_check = bloom.contains(item)
-        decrtypted_check = env.decrypt(encrypted_check)
+        decrtypted_check = env.decrypt(encrypted_check, dtype=int)
         check = decrtypted_check[0]
         assert check == 1, f"Bloom filter should contain '{item}'"
     print("\tTest passed: Added items are contained.")
@@ -27,7 +24,7 @@ def test_bloom_filter():
     # Test that non-added item is not contained (may have false positives)
     non_added_item = "date"
     encrypted_check = bloom.contains(non_added_item)
-    check = int(env.decrypt(encrypted_check)[0])
+    check = env.decrypt(encrypted_check, dtype=int)[0]
     assert check == 0, f"Bloom filter should not contain '{non_added_item}'"
     print("\tTest passed: Non-added item is not contained.")
 
@@ -35,7 +32,7 @@ def test_bloom_filter():
     bloom.clear()
     for item in items_to_add:
         encrypted_check = bloom.contains(item)
-        check = int(env.decrypt(encrypted_check)[0])
+        check = env.decrypt(encrypted_check, dtype=int)[0]
         assert check == 0, f"Bloom filter should be empty after clear, but contains '{item}'"
     print("\tTest passed: Bloom filter is empty after clear.")
-    print("All Bloom filter tests passed!")
+    print("✅ All Bloom filter tests passed!")

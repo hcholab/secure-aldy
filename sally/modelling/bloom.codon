@@ -32,7 +32,7 @@ class CipherBloomFilter[env_t, ctxt_t]:
             expected_elements: Expected number of elements to be added
             false_positive_rate: Desired false positive probability (default 0.01 = 1%)
         """
-        assert env.is_published(), (
+        assert env.is_published() or env.is_debug(), (
             "Environment must be published for Bloom filter to be secure.")
         self._env = env
 
@@ -52,7 +52,7 @@ class CipherBloomFilter[env_t, ctxt_t]:
                 f"Reduce expected elements or increase ciphertext size.")
             
         # Calculate optimal number of hash functions: k = m/n * ln(2)
-        self._num_hashes = max(1, int(self._size / expected_elements * log(2)))
+        self._num_hashes = max(1, int(required_size / expected_elements * log(2)))
     
     def _hash(self, item: str, seed: int) -> int:
         """
@@ -94,7 +94,9 @@ class CipherBloomFilter[env_t, ctxt_t]:
         
         for i in range(self._num_hashes):
             idx = self._hash(item, i)
-            check = env.mul(self._bit_array, one_hot_vector(idx, self._size, TP=int))
+            check = env.mul(
+                self._bit_array,
+                one_hot_vector(idx, self._size, TP=int))
             env.irotate(check, idx)
             env.imul(contains_mask, check)
 
