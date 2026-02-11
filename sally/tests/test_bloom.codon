@@ -1,32 +1,53 @@
-def test_bloom_filter():
-    from sequre.lattiseq.ckks import Ciphertext
+"""
+Testing the secure Bloom filter implementation in sally.modelling.bloom.
+"""
 
-    from ..modelling.bloom import CipherBloomFilter
-    from ..patch.lattiseq.env import CKKSEnv
-    
-    env = CKKSEnv(debug=True)
-    bloom = CipherBloomFilter[CKKSEnv, Ciphertext](
-        env, expected_elements=32)
-    print(f"\n⚙️ Testing secure Bloom filter {bloom.get_stats()} ...")
-    
-    items_to_add = ["apple", "banana", "cherry"]
-    for item in items_to_add:
-        bloom.add(item)
-    
+def test_bloom_filter_contains(added_items, bloom, env):
     # Test that added items are possibly contained
-    for item in items_to_add:
+    for item in added_items:
         encrypted_check = bloom.contains(item)
-        decrtypted_check = env.decrypt(encrypted_check, dtype=int)
-        check = decrtypted_check[0]
+        check = env.decrypt(encrypted_check, dtype=int)[0]
         assert check == 1, f"Bloom filter should contain '{item}'"
-    print("\tTest passed: Added items are contained.")
     
     # Test that non-added item is not contained (may have false positives)
     non_added_item = "date"
     encrypted_check = bloom.contains(non_added_item)
     check = env.decrypt(encrypted_check, dtype=int)[0]
     assert check == 0, f"Bloom filter should not contain '{non_added_item}'"
-    print("\tTest passed: Non-added item is not contained.")
+
+
+def test_bloom_filter():
+    from sequre.lattiseq.ckks import Ciphertext
+
+    from ..modelling.bloom import CipherBloomFilter
+    from ..patch.lattiseq.env import CKKSEnv
+    
+    # Using debug environment for testing to allow direct decryption of results
+    # In production, the environment should be published (env = env.publish())
+    # to ensure security of the Bloom filter.
+    env = CKKSEnv(debug=True)
+    bloom = CipherBloomFilter[CKKSEnv, Ciphertext](
+        env, expected_elements=32)
+    print(f"\n⚙️ Testing secure Bloom filter {bloom.get_stats()} ...")
+    
+    items_to_add = ["apple", "banana", "cherry"]
+    
+    # Test secure add
+    for item in items_to_add:
+        bloom.sadd(item)
+    
+    test_bloom_filter_contains(items_to_add, bloom, env)
+    print(f"\tTest passed: Securely added items are contained.")
+    
+    # Test non-secure add
+    for item in items_to_add:
+        bloom.add(item)
+    
+    bloom = bloom.publish()
+    bloom._env = env  # Used debug env for testing
+
+    test_bloom_filter_contains(items_to_add, bloom, env)
+    print(f"\tTest passed: Raw added items are contained.")
 
     # Test clearing the filter
     bloom.clear()

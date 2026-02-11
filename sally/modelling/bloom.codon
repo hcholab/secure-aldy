@@ -2,7 +2,8 @@
 Bloom filter implementation in Sequre/Shechi.
 """
 from math import log
-from numpy.create import zeros
+from numpy.create import zeros, zeros_like
+from numpy.ndarray import ndarray
 
 from sequre.utils.utils import one_hot_vector
 
@@ -20,7 +21,8 @@ class CipherBloomFilter[env_t, ctxt_t]:
     """
     
     _env: env_t
-    _bit_array: ctxt_t
+    _bit_array_enc: ctxt_t
+    _bit_array_raw: ndarray[Tuple[int], int]
     _size: int
     _num_hashes: int
     
@@ -37,8 +39,9 @@ class CipherBloomFilter[env_t, ctxt_t]:
         self._env = env
 
         # Use ciphertext size as the size of the bit array
-        self._size = env.params.slots()  
-        self._bit_array = env.zeros_ciphertext()
+        self._size = env.params.slots()
+        self._bit_array_enc = env.zeros_ciphertext()
+        self._bit_array_raw = zeros((self._size,), dtype=int)
 
         # Calculate optimal size of bit array: m = -n * ln(p) / (ln(2)^2)
         required_size = int(
@@ -62,28 +65,62 @@ class CipherBloomFilter[env_t, ctxt_t]:
         h = hash(item + str(seed))
         return abs(h) % self._size
     
-    def add(self, item: str) -> None:
+    def publish(self) -> CipherBloomFilter[env_t, ctxt_t]:
         """
-        Add an item to the Bloom filter.
+        Return a new Bloom filter instance with the same
+        but encrypted bit array.
+        """
+        return CipherBloomFilter[env_t, ctxt_t](
+            _env=self._env.publish(),
+            _bit_array_enc=self._env.encrypt(self._bit_array_raw),
+            _bit_array_raw=zeros_like(self._bit_array_raw),
+            _size=self._size,
+            _num_hashes=self._num_hashes
+        )
+
+    def get_hashes(self, item: str) -> ndarray[Tuple[int], int]:
+        """
+        Get array of hash values for the item.
         
-        Args:
-            item: String element to add to the filter
+        Returns:
+            Array of indices in the bit array to set/check for the item
         """
-        env = self._env
         hashes = zeros((self._size,), dtype=int)
         
         for i in range(self._num_hashes):
             idx = self._hash(item, i)
             hashes[idx] = 1
         
+        return hashes
+    
+    def add(self, item: str) -> None:
+        """
+        Add an item to the raw Bloom filter.
+        
+        Args:
+            item: String element to add to the filter
+        """
+        hashes = self.get_hashes(item)
+        self._bit_array_raw |= hashes
+    
+    def sadd(self, item: str) -> None:
+        """
+        Add an item to the encrypted Bloom filter.
+        
+        Args:
+            item: String element to add to the filter
+        """
+        env = self._env
+        hashes = self.get_hashes(item)
+        
         # Bitwise OR: a + b - a * b
-        self._bit_array = env.add(
-            env.mul(self._bit_array, (1 - hashes)),
+        self._bit_array_enc = env.add(
+            env.mul(self._bit_array_enc, (1 - hashes)),
             hashes)
     
     def contains(self, item: str) -> ctxt_t:
         """
-        Check if an item might be in the Bloom filter.
+        Check if an item might be in the encrypted Bloom filter.
         
         Returns:
             bool: False if definitely not in set, True if possibly in set
@@ -95,7 +132,7 @@ class CipherBloomFilter[env_t, ctxt_t]:
         for i in range(self._num_hashes):
             idx = self._hash(item, i)
             check = env.mul(
-                self._bit_array,
+                self._bit_array_enc,
                 one_hot_vector(idx, self._size, TP=int))
             env.irotate(check, idx)
             env.imul(contains_mask, check)
@@ -104,7 +141,8 @@ class CipherBloomFilter[env_t, ctxt_t]:
     
     def clear(self) -> None:
         """Reset the Bloom filter to empty state."""
-        self._bit_array = self._env.zeros_ciphertext()
+        self._bit_array_enc = self._env.zeros_ciphertext()
+        self._bit_array_raw = zeros((self._size,), dtype=int)
     
     def get_stats(self) -> tuple[int, int]:
         """
