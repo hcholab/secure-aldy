@@ -5,56 +5,204 @@ Server-side logic for secure star-allele calling using fully homomorphic encrypt
     - Solve ILP using custom solvers (e.g., hill climbing).
     - Validate solution and extract selected alleles and novel mutations.
 """
+from numpy.create import zeros
+from sequre.types.builtin import ndarray
 
-from modelling.ilp import build_major_mats
+
+# def filter_alleles(
+#     alleles, filtered_cov: Ciphertensor, cn_bloom: BloomFilter
+# ) -> Ciphertensor:
+#     """
+#     Filter alleles that are not expressed.
+
+#     :returns: Expressed alleles.
+#     """
+#     mask = Ciphertensor[Ciphertext].zeros((len(alleles),))
+#     for an, a in natsorted(alleles.items()):
+#         mask += cn_bloom.contains(a.cn_config).rotate(an)
+    
+#     cov_mask = alleles @ filtered_cov
+#     mask *= cov_mask
+
+#     if (mask.reduce_add() > 0).reveal() == 0:
+#         raise ValueError("\n✗ No candidate alleles found!")
+    
+#     return filter_by_mask(alleles, mask > 0, max_size=ALLELE_DB_MAX_SIZE)
 
 
-def filter_alleles(
-    alleles, filtered_cov: Ciphertensor, cn_bloom: BloomFilter
-) -> Ciphertensor:
+def hill_climbing(matrices, max_iterations=5000, restarts=10):
     """
-    Filter alleles that are not expressed.
-
-    :returns: Expressed alleles.
+    Custom heuristic solver using Hill Climbing with random restarts.
+    
+    Hill climbing is a simple local search that always moves to better neighbors.
+    Multiple restarts help escape local optima.
     """
-    mask = Ciphertensor[Ciphertext].zeros((len(alleles),))
-    for an, a in natsorted(alleles.items()):
-        mask += cn_bloom.contains(a.cn_config).rotate(an)
     
-    cov_mask = alleles @ filtered_cov
-    mask *= cov_mask
-
-    return filter_by_mask(alleles, mask > 0, max_size=ALLELE_DB_MAX_SIZE)
-
-
-def call_alleles(gene, filtered_cov, cn_solution, func_muts, solver_type):
-    # Filter alleles and get functional mutations
-    print(f"\nFiltering alleles and mutations...")
-    alleles = filter_alleles(gene, filtered_cov, cn_solution)
-    print(f"  Candidate alleles: {len(alleles)}")
-    
-    if not alleles:
-        print("\n✗ No candidate alleles found!")
-        return
-    
-    # Extract mats
     print(f"\n{'='*70}")
-    print(f"EXTRACTING ILP mats")
+    print(f"CUSTOM HEURISTIC SOLVER (Hill Climbing)")
     print(f"{'='*70}")
-    mats = build_major_mats(
-        gene, filtered_cov, cn_solution, alleles, func_muts)
     
-    print(f"\nMatrix dimensions:")
-    print(f"  A: {mats.A.shape[0]} × {mats.A.shape[1]} (muts × alls)")
-    print(f"  B: {mats.B.shape[0]} × {mats.B.shape[1]} (CN confs × alls)")
-    print(f"  c: {len(mats.c)} (coverage observations)")
-    print(f"  d: {len(mats.d)} (CN requirements)")
+    print(f"\nHill Climbing parameters:")
+    print(f"  - Max iterations per restart: {max_iterations}")
+    print(f"  - Number of restarts: {restarts}")
     
+    def compute_objective(x, y, z):
+        """Compute objective value for given solution."""
+        e = matrices.c - (matrices.A @ x.expand_dims(axis=1)).flatten() - y
+        return e.abs().sum() + matrices.lambda_novel * z + 0.1 * y.sum()
+    
+    def is_feasible(x, y):
+        """Check if solution satisfies hard constraints."""
+        # CN configuration must match
+        for t in range(matrices.B.shape[0]):
+            if abs(matrices.B[t, :].dot(x, axis=0) - matrices.d[t]) > 0.5:
+                return False
+        
+        # Ordering constraints
+        for j1, j2 in matrices.P_indices:
+            if x[j1] > x[j2] + 0.5:
+                return False
+        
+        # One novel per position
+        for pos, indices in matrices.position_groups.items():
+            if sum(y[i] for i in indices) > 1.5:
+                return False
+        
+        return True
+    
+    def generate_initial_solution():
+        """Generate a feasible initial solution greedily."""
+        x = zeros(matrices.n_alleles, dtype=int)
+        y = zeros(matrices.n_mutations, dtype=int)
+        
+        # Select alleles to satisfy CN constraints
+        for t in range(matrices.n_cn_configs):
+            required = int(matrices.d[t])
+            candidates = [j for j in range(matrices.n_alleles) if matrices.B[t, j] == 1]
+            # selected = np.random.choice(candidates, min(required, len(candidates)), replace=False)
+            selected = candidates[:required]  # Greedy selection
+            for j in selected:
+                x[j] = 1
+        
+        # Skip novel mutations for now - start with none selected
+        # # Mark mutations as novel if not covered
+        # for i in range(matrices.n_mutations):
+        #     if matrices.mutation_vars[i].op != "_":
+        #         coverage_from_alleles = matrices.A[i, :] @ x
+        #         if coverage_from_alleles < 0.5:
+        #             y[i] = 1
+        
+        z = 1 if y.sum() > 0.5 else 0
+        return x, y, z
+    
+    def get_neighbors(x, y, z):
+        """Generate all feasible neighboring solutions."""
+        neighbors = []
+        
+        # Try swapping each selected allele with an unselected one (same CN config)
+        selected = [j for j in range(matrices.n_alleles) if x[j] > 0.5]
+        unselected = [j for j in range(matrices.n_alleles) if x[j] < 0.5]
+        
+        for j_out in selected:
+            t_out = [t for t in range(matrices.n_cn_configs) if matrices.B[t, j_out] > 0.5][0]
+            for j_in in unselected:
+                if matrices.B[t_out, j_in] > 0.5:
+                    x_new = x.copy()
+                    x_new[j_out] = 0
+                    x_new[j_in] = 1
+                    y_new = y.copy()
+                    z_new = 1 if y_new.sum() > 0.5 else 0
+                    if is_feasible(x_new, y_new):
+                        neighbors.append((x_new, y_new, z_new))
+        
+        # Skip novel mutation flips for now - they can be added later if needed
+        # # Try flipping novel mutation indicators
+        # for i in range(matrices.n_mutations):
+        #     if matrices.mutation_vars[i].op != "_":
+        #         y_new = y.copy()
+        #         y_new[i] = 1 - y_new[i]
+        #         z_new = 1 if y_new.sum() > 0.5 else 0
+        #         if is_feasible(x, y_new):
+        #             neighbors.append((x.copy(), y_new, z_new))
+        
+        return neighbors
+    
+    # Global best
+    x_best_global, y_best_global, z_best_global = None, None, None
+    obj_best_global = float('inf')
+    
+    print(f"\nRunning hill climbing with {restarts} restarts...")
+    
+    total_iterations = 0
+    total_improvements = 0
+    
+    for restart in range(restarts):
+        # Generate initial solution
+        x_current, y_current, z_current = generate_initial_solution()
+        obj_current = compute_objective(x_current, y_current, z_current)
+        
+        improved_this_restart = 0
+        iterations_this_restart = 0
+        
+        for iteration in range(max_iterations):
+            iterations_this_restart += 1
+            total_iterations += 1
+            
+            # Generate all neighbors
+            neighbors = get_neighbors(x_current, y_current, z_current)
+            
+            if not neighbors:
+                break  # No neighbors, stuck
+            
+            # Find best neighbor
+            best_neighbor = None
+            best_neighbor_obj = obj_current
+            
+            for x_new, y_new, z_new in neighbors:
+                obj_new = compute_objective(x_new, y_new, z_new)
+                if obj_new < best_neighbor_obj:
+                    best_neighbor = (x_new, y_new, z_new)
+                    best_neighbor_obj = obj_new
+            
+            # Move to best neighbor if better
+            if best_neighbor != None and best_neighbor_obj < obj_current:
+                x_current, y_current, z_current = best_neighbor
+                obj_current = best_neighbor_obj
+                improved_this_restart += 1
+                total_improvements += 1
+            else:
+                # Local optimum reached
+                break
+        
+        # Update global best
+        if obj_current < obj_best_global:
+            x_best_global = x_current.copy()
+            y_best_global = y_current.copy()
+            z_best_global = z_current
+            obj_best_global = obj_current
+        
+        print(f"  Restart {restart+1}/{restarts}: obj={obj_current:.4f} "
+              f"(iterations={iterations_this_restart}, improvements={improved_this_restart})")
+    
+    print(f"\n✓ Completed hill climbing")
+    print(f"\nFinal statistics:")
+    print(f"  Total iterations: {total_iterations}")
+    print(f"  Total improvements: {total_improvements}")
+    print(f"  Best objective: {obj_best_global:.4f}")
+    
+    # Compute final error vector
+    e_best = matrices.c - (matrices.A @ x_best_global.expand_dims(axis=1)).flatten() - y_best_global
+    print(f"\nBest objective value: {obj_best_global:.4f}")
+    
+    return obj_best_global, x_best_global, y_best_global, e_best, z_best_global
+
+
+def call_alleles(mats, solver_type):
     # Solve with selected solver
     if solver_type == 'hc':
         obj_val, x_val, y_val, e_val, z_val = hill_climbing(mats)
     elif solver_type == 'exhaustive':
-        obj_val, x_val, y_val, e_val, z_val = exhaustive_search(mats)
+        raise NotImplementedError("Exhaustive solver not implemented yet.")
     else:
         raise ValueError(f"Unknown solver type: {solver_type}.")
 
@@ -62,12 +210,7 @@ def call_alleles(gene, filtered_cov, cn_solution, func_muts, solver_type):
 
 
 def _debug_validate_solution(
-    mats: MajorILPmats,
-    x: np.ndarray,
-    y: np.ndarray,
-    e: np.ndarray,
-    z: float,
-) -> Dict[str, Any]:
+    mats, x, y, e, z):
     """
     Validate that a solution satisfies all constraints and compute objective.
     
@@ -78,47 +221,50 @@ def _debug_validate_solution(
     :param z: Novel indicator
     :return: Dict with validation results and constraint violations
     """
-    violations = []
+    valid = True
     
     # Check coverage equality: A·x + y + e = c
-    coverage_lhs = mats.A @ x + y + e
-    coverage_diff = np.abs(coverage_lhs - mats.c)
-    if len(coverage_diff) > 0 and np.max(coverage_diff) > 1e-6:
-        violations.append(f"Coverage equality violated: max diff = {np.max(coverage_diff)}")
+    coverage_lhs = (mats.A @ x.expand_dims(axis=1)).flatten() + y + e
+    coverage_diff = (coverage_lhs - mats.c).abs()
+    if len(coverage_diff) > 0 and (coverage_diff).max() > 1e-6:
+        print(f"VIOLATION FOUND: Coverage equality violated: max diff = {(coverage_diff).max()}")
+        valid = False
     
     # Check CN configuration: B·x = d
-    cn_lhs = mats.B @ x
-    cn_diff = np.abs(cn_lhs - mats.d)
-    if len(cn_diff) > 0 and np.max(cn_diff) > 1e-6:
-        violations.append(f"CN configuration violated: max diff = {np.max(cn_diff)}")
+    cn_lhs = (mats.B @ x.expand_dims(axis=1)).flatten()
+    cn_diff = (cn_lhs - mats.d).abs()
+    if len(cn_diff) > 0 and (cn_diff).max() > 1e-6:
+        print(f"VIOLATION FOUND: CN configuration violated: max diff = {(cn_diff).max()}")
+        valid = False
     
     # Check ordering: x[j1] <= x[j2] for all (j1, j2) in P_indices
     for j1, j2 in mats.P_indices:
         if x[j1] > x[j2] + 1e-6:
-            violations.append(f"Ordering violated: x[{j1}] = {x[j1]} > x[{j2}] = {x[j2]}")
+            print(f"VIOLATION FOUND: Ordering violated: x[{j1}] = {x[j1]} > x[{j2}] = {x[j2]}")
+            valid = False
     
     # Check novel indicator: z >= y[i] for all i
     for i in range(mats.n_mutations):
         if z < y[i] - 1e-6:
-            violations.append(f"Novel indicator violated: z = {z} < y[{i}] = {y[i]}")
+            print(f"VIOLATION FOUND: Novel indicator violated: z = {z} < y[{i}] = {y[i]}")
+            valid = False
     
     # Check one novel per position
     for pos, indices in mats.position_groups.items():
         total = sum(y[i] for i in indices)
         if total > 1 + 1e-6:
-            violations.append(f"One-novel-per-position violated at pos {pos}: sum = {total}")
+            print(f"VIOLATION FOUND: One-novel-per-position violated at pos {pos}: sum = {total}")
+            valid = False
     
     # Compute objective
-    objective = np.sum(np.abs(e)) + mats.lambda_novel * z + 0.1 * np.sum(y)
+    objective = e.abs().sum() + mats.lambda_novel * float(z) + 0.1 * y.sum()
     
     return {
-        "valid": len(violations) == 0,
-        "violations": violations,
         "objective": objective,
-        "coverage_fit": np.sum(np.abs(e)),
-        "novel_penalty": mats.lambda_novel * z,
-        "mutation_penalty": 0.1 * np.sum(y),
-    }
+        "coverage_fit": e.abs().sum(),
+        "novel_penalty": mats.lambda_novel * float(z),
+        "mutation_penalty": 0.1 * y.sum(),
+    }, valid
 
 
 def _debug_validate(mats, x_val, y_val, e_val, z_val):
@@ -126,11 +272,9 @@ def _debug_validate(mats, x_val, y_val, e_val, z_val):
     print(f"\n{'='*70}")
     print(f"VALIDATING SOLUTION")
     print(f"{'='*70}")
-    validation = _debug_validate_solution(mats, x_val, y_val, e_val, z_val)
+    validation, valid = _debug_validate_solution(mats, x_val, y_val, e_val, z_val)
     
-    if validation["valid"]:
+    if valid:
         print(f"✓ Solution is VALID - all constraints satisfied")
     else:
-        print(f"✗ Solution has VIOLATIONS:")
-        for v in validation["violations"]:
-            print(f"    - {v}")
+        print(f"✗ Solution has VIOLATIONS!")

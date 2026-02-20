@@ -4,9 +4,223 @@ Client-side code for secure star-allele calling:
     - Postprocess ILP solution to determine selected alleles and novel mutations.
 """
 
+from numpy.create import array
+from numpy.ndarray import ndarray
+
+
+class MajorILPMatrices:
+    # Core matrices and vectors
+    A: ndarray[tuple[int, int], int]  # m × n (mutations × allele copies)
+    B: ndarray[tuple[int, int], int]  # k × n (CN configs × allele copies)
+    c: ndarray[tuple[int], float]  # m (coverage)
+    d: ndarray[tuple[int], int]  # k (CN counts)
+    P_indices: list[tuple[int, int]]  # Ordering constraints
+    lambda_novel: float  # Penalty coefficient
+    position_groups: dict[int, list[int]]  # Position to mutation indices mapping
+
+    def __init__(
+            self, A: pyobj, B: pyobj, c: pyobj, d: pyobj,
+            P_indices: pyobj, lambda_novel: pyobj, position_groups: pyobj):
+        _A: list[list[int]] = A.tolist()
+        _B: list[list[int]] = B.tolist()
+        _c: list[float] = c.tolist()
+        _d: list[int] = d.tolist()
+        _P_indices: list[tuple[int, int]] = P_indices
+        _lambda_novel: float = lambda_novel
+        _position_groups: dict[int, list[int]] = position_groups
+        
+        self.A = array(_A)
+        self.B = array(_B)
+        self.c = array(_c)
+        self.d = array(_d)
+        self.P_indices = _P_indices
+        self.lambda_novel = _lambda_novel
+        self.position_groups = _position_groups
+    
+    @property
+    def n_alleles(self) -> int:
+        """Number of allele copy variables (dimension of x)."""
+        return self.A.shape[1]
+    
+    @property
+    def n_mutations(self) -> int:
+        """Number of mutation variables (dimension of y)."""
+        return self.A.shape[0]
+    
+    @property
+    def n_cn_configs(self) -> int:
+        """Number of CN configurations (dimension of d)."""
+        return self.B.shape[0]
+
 
 @python
-def preprocess(bam_file, gene_name, profile_name):
+def build_major_mats(
+    gene,
+    coverage,
+    cn_solution,
+    allele_dict,
+    func_muts):
+    """
+    Build ILP matrices from gene data, coverage, and CN solution.
+    
+    :param gene: Gene instance
+    :param coverage: Coverage instance
+    :param cn_solution: Copy-number solution
+    :param allele_dict: Dictionary of candidate major alleles
+    :param func_muts: Set of functional mutations observed
+    :return: MajorILPMatrices object containing all matrices and metadata
+    """
+    import numpy as np
+    from typing import Dict, List, Tuple
+    from dataclasses import dataclass
+    from natsort import natsorted
+
+    from aldy.gene import MajorAllele, Mutation
+
+    @dataclass
+    class MajorILPMatrices:
+        
+        # Core matrices and vectors
+        A: np.ndarray  # m × n (mutations × allele copies)
+        B: np.ndarray  # k × n (CN configs × allele copies)
+        c: np.ndarray  # m (coverage)
+        d: np.ndarray  # k (CN counts)
+        P_indices: List[Tuple[int, int]]  # Ordering constraints
+        lambda_novel: float  # Penalty coefficient
+        position_groups: Dict[int, List[int]]  # Position to mutation indices mapping
+        
+        @property
+        def n_alleles(self) -> int:
+            """Number of allele copy variables (dimension of x)."""
+            return self.A.shape[1]
+        
+        @property
+        def n_mutations(self) -> int:
+            """Number of mutation variables (dimension of y)."""
+            return self.A.shape[0]
+        
+        @property
+        def n_cn_configs(self) -> int:
+            """Number of CN configurations (dimension of d)."""
+            return self.B.shape[0]
+    
+    # Step 1: Build allele copies based on CN solution
+    allele_copies: List[Tuple[str, int, MajorAllele]] = []
+    for allele_name in natsorted(allele_dict.keys()):
+        allele = allele_dict[allele_name]
+        max_cn = cn_solution.solution[allele.cn_config]
+        for copy_idx in range(max_cn):
+            allele_copies.append((allele_name, copy_idx, allele))
+    
+    n_alleles = len(allele_copies)
+    
+    # Step 2: Build mutation list (include both actual mutations and reference "_")
+    mutation_list: List[Mutation] = []
+    mutation_to_idx: Dict[Mutation, int] = {}
+    
+    # Add functional mutations
+    for m in sorted(func_muts):
+        if m not in mutation_to_idx:
+            mutation_to_idx[m] = len(mutation_list)
+            mutation_list.append(m)
+    
+    # Add reference mutations for each position
+    positions = set(m.pos for m in func_muts)
+    for pos in sorted(positions):
+        ref_m = Mutation(pos, "_")
+        if ref_m not in mutation_to_idx:
+            mutation_to_idx[ref_m] = len(mutation_list)
+            mutation_list.append(ref_m)
+    
+    n_mutations = len(mutation_list)
+    
+    # Step 3: Build A matrix (allele-mutation incidence)
+    A = np.zeros((n_mutations, n_alleles), dtype=int)
+    
+    for j, (allele_name, copy_idx, allele) in enumerate(allele_copies):
+        # Mark functional mutations present in this allele
+        for m in allele.func_muts:
+            if m in mutation_to_idx:
+                i = mutation_to_idx[m]
+                A[i, j] = 1
+        
+        # Mark reference positions (positions without mutations in this allele)
+        for m in mutation_list:
+            if m.op == "_":
+                pos = m.pos
+                if not gene.has_coverage(allele_name, pos):
+                    continue
+                # Check if this position has an insertion (insertions still contribute)
+                has_non_ins = any(
+                    ma.pos == pos and ma.op[:3] != "ins" 
+                    for ma in allele.func_muts
+                )
+                if not has_non_ins:
+                    i = mutation_to_idx[m]
+                    A[i, j] = 1
+    
+    # Step 4: Build c vector (normalized coverage)
+    c = np.zeros(n_mutations)
+    for i, m in enumerate(mutation_list):
+        if coverage.single_copy(m.pos, cn_solution) == 0:
+            c[i] = 0.0
+        else:
+            c[i] = coverage[m] / coverage.single_copy(m, cn_solution)
+    
+    # Step 5: Build B matrix and d vector (CN configuration constraints)
+    cn_config_list = natsorted(set(allele.cn_config for _, _, allele in allele_copies))
+    cn_config_to_idx = {cfg: idx for idx, cfg in enumerate(cn_config_list)}
+    n_cn_configs = len(cn_config_list)
+    
+    B = np.zeros((n_cn_configs, n_alleles), dtype=int)
+    d = np.zeros(n_cn_configs, dtype=int)
+    
+    for t, cfg in enumerate(cn_config_list):
+        d[t] = cn_solution.solution[cfg]
+        for j, (_, _, allele) in enumerate(allele_copies):
+            if allele.cn_config == cfg:
+                B[t, j] = 1
+    
+    # Step 6: Build ordering constraints (x[j+1] <= x[j] for same allele)
+    P_indices: List[Tuple[int, int]] = []
+    current_idx = 0
+    for allele_name in natsorted(allele_dict.keys()):
+        allele = allele_dict[allele_name]
+        max_cn = cn_solution.solution[allele.cn_config]
+        for copy_idx in range(1, max_cn):
+            # x[current_idx + copy_idx] <= x[current_idx + copy_idx - 1]
+            # Rewritten as: x[current_idx + copy_idx] - x[current_idx + copy_idx - 1] <= 0
+            P_indices.append((current_idx + copy_idx, current_idx + copy_idx - 1))
+        current_idx += max_cn
+    
+    # Step 7: Build position groups (for one-novel-per-position constraint)
+    position_groups: Dict[int, List[int]] = {}
+    for i, m in enumerate(mutation_list):
+        if m.op != "_" and m.op[:3] != "ins":
+            pos = m.pos
+            if pos not in position_groups:
+                position_groups[pos] = []
+            position_groups[pos].append(i)
+    
+    # Step 8: Build mutation positions dict
+    mutation_positions = {i: m.pos for i, m in enumerate(mutation_list)}
+    
+    # Step 9: Build metadata
+    allele_vars = [(name, idx) for name, idx, _ in allele_copies]
+    lambda_novel = coverage.profile.major_novel
+    
+    metadata = (allele_vars, mutation_list, mutation_positions, cn_config_list)
+    
+    return MajorILPMatrices(
+        A=A, B=B, c=c, d=d, P_indices=P_indices,
+        lambda_novel=lambda_novel,
+        position_groups=position_groups), metadata
+
+
+@python
+def aldy_cn_to_ilp(bam_file, gene_name, profile_name):
+    import pickle
+    
     from aldy.sam import Sample
     from aldy.cn import estimate_cn
     from aldy.solutions import CNSolution
@@ -14,6 +228,7 @@ def preprocess(bam_file, gene_name, profile_name):
     from aldy.profile import Profile
     from aldy.common import script_path
     from aldy.coverage import Coverage
+    from aldy.major import _filter_alleles
 
     def filter_coverage(
         coverage: Coverage, cn_solution: CNSolution
@@ -75,7 +290,9 @@ def preprocess(bam_file, gene_name, profile_name):
         cn_solution = cn_solutions[0]
     print(f"\nCN configuration: {dict(cn_solution.solution)}")
 
-    filtered_cov = filter_coverage(sample.coverage, cn_solution)
+    # Filter alleles and get functional mutations
+    print(f"\nFiltering alleles and mutations...")
+    alleles, filtered_cov = _filter_alleles(gene, sample.coverage, cn_solution)
     
     func_muts = {
         Mutation(*m)
@@ -89,14 +306,78 @@ def preprocess(bam_file, gene_name, profile_name):
     }
 
     print(f"  Functional mutations observed: {len(func_muts)}")
-    return cn_solution, filtered_cov, func_muts
+
+    # Extract mats
+    print(f"\n{'='*70}")
+    print(f"EXTRACTING ILP mats")
+    print(f"{'='*70}")
+    mats, metadata = build_major_mats(
+        gene, filtered_cov, cn_solution, alleles, func_muts)
+    
+    print(f"\nMatrix dimensions:")
+    print(f"  A: {mats.A.shape[0]} × {mats.A.shape[1]} (muts × alls)")
+    print(f"  B: {mats.B.shape[0]} × {mats.B.shape[1]} (CN confs × alls)")
+    print(f"  c: {len(mats.c)} (coverage observations)")
+    print(f"  d: {len(mats.d)} (CN requirements)")
+
+    pickle.dump(metadata, open("dump/metadata.pkl", "wb"))
+    return mats
+
+
+def preprocess(bam_file, gene_name, profile_name):
+    """Preprocess BAM file and gene profile to extract ILP matrices."""
+    mats = aldy_cn_to_ilp(bam_file, gene_name, profile_name)
+
+    return MajorILPMatrices(
+        A=mats.A, B=mats.B, c=mats.c, d=mats.d,
+        P_indices=mats.P_indices, lambda_novel=mats.lambda_novel,
+        position_groups=mats.position_groups)
 
 
 @python
-def postprocess(matrices, x_val, y_val, obj_val, gene_name):
-    from modelling.ilp import extract_solution
+def postprocess(x_val: list[int], y_val: list[int], obj_val: float, gene_name: str):
+    """
+    Postprocess ILP solution to determine selected alleles and novel mutations.
+    Uses metadata: allele_vars, mutation_list, mutation_positions, cn_config_list
+    """
+    import pickle
+
+    from typing import List, Tuple
+    from aldy.gene import Mutation
+
+    def extract_solution(
+        allele_vars: List[Tuple[str, int]],
+        mutation_vars: List[Mutation],
+        x: List[int],
+        y: List[int],
+    ) -> Tuple[List[str], List[Mutation]]:
+        """
+        Extract human-readable solution from variable values.
+        
+        :param matrices: The ILP matrices containing metadata
+        :param x: Binary allele selection vector (n,)
+        :param y: Binary novel mutation vector (m,)
+        :return: Tuple of (selected_alleles, novel_mutations)
+        """
+        selected_alleles = [
+            allele_vars[j][0]  # allele name
+            for j in range(len(x))
+            if x[j] > 0.5  # binary variable is selected
+        ]
+        
+        novel_mutations = [
+            mutation_vars[i]
+            for i in range(len(y))
+            if y[i] > 0.5  # binary variable is selected
+        ]
+        
+        return selected_alleles, novel_mutations
     
-    selected_alleles, novel_muts = extract_solution(matrices, x_val, y_val)
+    metadata = pickle.load(open("dump/metadata.pkl", "rb"))
+    allele_vars, mutation_list, mutation_positions, cn_config_list = metadata
+    
+    selected_alleles, novel_muts = extract_solution(
+        allele_vars, mutation_list, x_val, y_val)
     
     print(f"\n{'='*70}")
     print(f"FINAL RESULT")

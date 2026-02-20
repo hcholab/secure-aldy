@@ -11,17 +11,17 @@ def test_sally_workflow(bam_file, gene_name, profile_name, solver_type):
     print("SECURE STAR-ALLELE CALLING USING FHE")
     print("="*70)
 
-    cn_solution, filtered_cov, func_muts = client.preprocess(
+    mats = client.preprocess(
         bam_file, gene_name, profile_name)
     
     matrices, obj_val, x_val, y_val, e_val, z_val = server.call_alleles(
-        gene_name, filtered_cov, cn_solution, func_muts, solver_type)
+        mats, solver_type)
 
-    # # Non-secure: Validate revealed solution
-    # server._debug_validate(matrices, x_val, y_val, e_val, z_val)
+    # Non-secure: Validate revealed solution
+    server._debug_validate(matrices, x_val, y_val, e_val, z_val)
     
-    # # Extract human-readable solution
-    # client.postprocess(matrices, x_val, y_val, obj_val, gene_name)
+    # Extract human-readable solution
+    client.postprocess(x_val.tolist(), y_val.tolist(), obj_val, gene_name)
 
 
 if __name__ == "__main__":
